@@ -1,36 +1,44 @@
-# This is a basic workflow to help you get started with Actions
 
-name: CI
+name: Build Android APK
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  build-android:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    strategy:
+      matrix:
+        arch: [arm64-v8a]
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Check out OpenSCQ30 source
+        uses: actions/checkout@v4
+        with:
+          repository: Oppzippy/OpenSCQ30
+          ref: v2.13.0
+          path: source
+          persist-credentials: false
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Install Android build tools
+        uses: ./source/.github/actions/install-android-build-tools
+        with:
+          cache: false
+          arch: ${{ matrix.arch }}
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+      - name: Install just
+        run: sudo snap install just --classic
+
+      - name: Build Android APK
+        working-directory: source
+        run: just build-android-${{ matrix.arch }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: openscq30-android-${{ matrix.arch }}
+          path: source/build-output/*
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,297 @@
+from pathlib import Path
+
+ROOT = Path("lib/src/devices/soundcore/d1301")
+
+
+def replace_once(path, old, new):
+    p = Path(path)
+    s = p.read_text()
+    if new in s:
+        return
+    if old not in s:
+        raise RuntimeError(f"Не найден фрагмент: {path}\n{old}")
+    p.write_text(s.replace(old, new, 1))
+
+
+# 1. Structure for balance.
+p = ROOT / "structures.rs"
+s = p.read_text()
+if "pub struct VolumeBalance" not in s:
+    s += """
+
+/// Experimental volume balance setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VolumeBalance(i8);
+
+impl VolumeBalance {
+    pub fn new(value: i8) -> Self {
+        Self(value.clamp(-6, 6))
+    }
+
+    pub fn inner(&self) -> i8 {
+        self.0
+    }
+
+    pub fn bytes(&self) -> [u8; 1] {
+        [(self.0 + 100) as u8]
+    }
+}
+"""
+    p.write_text(s)
+
+
+# 2. Add the field to D1301State and initialize it.
+p = ROOT / "state.rs"
+s = p.read_text()
+if "volume_balance: d1301::structures::VolumeBalance" not in s:
+    s = s.replace(
+        "    auto_stop_timer: d1301::structures::AutoStopTimer,",
+        "    volume_balance: d1301::structures::VolumeBalance,\n"
+        "    auto_stop_timer: d1301::structures::AutoStopTimer,",
+        1,
+    )
+    s = s.replace(
+        "            auto_stop_timer,\n",
+        "            volume_balance: Default::default(),\n"
+        "            auto_stop_timer,\n",
+        1,
+    )
+    p.write_text(s)
+
+
+# 3. Add outbound packet.
+p = ROOT / "packets" / "outbound.rs"
+s = p.read_text()
+if "set_volume_balance" not in s:
+    s = s.replace(
+        "        PostSleepAudio,\n",
+        "        PostSleepAudio, VolumeBalance,\n",
+        1,
+    )
+    s += """
+
+/// Experimental: command format borrowed from another Soundcore model.
+/// D1301 support has not yet been confirmed.
+pub fn set_volume_balance(balance: VolumeBalance) -> packet::Outbound {
+    packet::Outbound::new(
+        packet::Command([16, 140]),
+        balance.bytes().to_vec(),
+    )
+}
+"""
+    p.write_text(s)
+
+
+# 4. Module implementation.
+module_dir = ROOT / "modules" / "volume_balance"
+module_dir.mkdir(parents=True, exist_ok=True)
+
+(ROOT / "modules" / "volume_balance.rs").write_text("""
+use std::sync::Arc;
+
+use openscq30_lib_has::Has;
+use strum::{EnumIter, EnumString, IntoStaticStr};
+
+use crate::{
+    api::settings::{CategoryId, SettingId},
+    devices::soundcore::{
+        common::{modules::ModuleCollection, packet::PacketIOController},
+        d1301,
+    },
+    macros::enum_subset,
+};
+
+mod setting_handler;
+mod state_modifier;
+
+enum_subset!(
+    SettingId,
+    #[derive(EnumString, EnumIter, IntoStaticStr)]
+    enum VolumeBalanceSetting {
+        VolumeBalance,
+    }
+);
+
+impl<T> ModuleCollection<T>
+where
+    T: Has<d1301::structures::VolumeBalance> + Clone + Send + Sync,
+{
+    pub fn add_d1301_volume_balance(&mut self, packet_io: Arc<PacketIOController>) {
+        self.setting_manager.add_handler(
+            CategoryId::Miscellaneous,
+            setting_handler::VolumeBalanceSettingHandler,
+        );
+        self.state_modifiers
+            .push(Box::new(state_modifier::VolumeBalanceStateModifier::new(
+                packet_io,
+            )));
+    }
+}
+""".strip() + "\\n")
+
+(module_dir / "setting_handler.rs").write_text("""
+use async_trait::async_trait;
+use openscq30_lib_has::Has;
+use strum::IntoEnumIterator;
+
+use crate::{
+    api::settings::{Setting, SettingId, Value},
+    devices::soundcore::{
+        common::settings_manager::{SettingHandler, SettingHandlerResult},
+        d1301::structures::VolumeBalance,
+    },
+    settings,
+};
+
+use super::VolumeBalanceSetting;
+
+#[derive(Default)]
+pub struct VolumeBalanceSettingHandler;
+
+#[async_trait]
+impl<T> SettingHandler<T> for VolumeBalanceSettingHandler
+where
+    T: Has<VolumeBalance> + Send,
+{
+    fn settings(&self) -> Vec<SettingId> {
+        VolumeBalanceSetting::iter().map(Into::into).collect()
+    }
+
+    fn get(&self, state: &T, setting_id: &SettingId) -> Option<Setting> {
+        let balance: &VolumeBalance = state.get();
+        let setting: VolumeBalanceSetting = (*setting_id).try_into().ok()?;
+
+        match setting {
+            VolumeBalanceSetting::VolumeBalance => Some(Setting::I32Range {
+                setting: settings::Range {
+                    range: -6..=6,
+                    step: 1,
+                },
+                value: balance.inner().into(),
+            }),
+        }
+    }
+
+    async fn set(
+        &self,
+        state: &mut T,
+        setting_id: &SettingId,
+        value: Value,
+    ) -> SettingHandlerResult<()> {
+        let setting: VolumeBalanceSetting = (*setting_id)
+            .try_into()
+            .expect("already filtered by SettingsManager");
+
+        match setting {
+            VolumeBalanceSetting::VolumeBalance => {
+                *state.get_mut() = VolumeBalance::new(
+                    i8::try_from(value.try_as_i32()?.clamp(-6, 6))
+                        .expect("-6 to 6 fits in i8"),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+""".strip() + "\\n")
+
+(module_dir / "state_modifier.rs").write_text("""
+use async_trait::async_trait;
+use openscq30_lib_has::Has;
+use std::sync::Arc;
+use tokio::sync::watch;
+
+use crate::{
+    api::device,
+    devices::soundcore::{
+        d1301::{self, structures::VolumeBalance},
+        common::{packet::PacketIOController, state_modifier::StateModifier},
+    },
+};
+
+pub struct VolumeBalanceStateModifier {
+    packet_io: Arc<PacketIOController>,
+}
+
+impl VolumeBalanceStateModifier {
+    pub fn new(packet_io: Arc<PacketIOController>) -> Self {
+        Self { packet_io }
+    }
+}
+
+#[async_trait]
+impl<T> StateModifier<T> for VolumeBalanceStateModifier
+where
+    T: Has<VolumeBalance> + Clone + Send + Sync,
+{
+    async fn move_to_state(
+        &self,
+        state_sender: &watch::Sender<T>,
+        target_state: &T,
+    ) -> device::Result<()> {
+        let target = target_state.get();
+
+        {
+            let state = state_sender.borrow();
+            if state.get() == target {
+                return Ok(());
+            }
+        }
+
+        self.packet_io
+            .send_with_response(
+                &d1301::packets::outbound::set_volume_balance(*target),
+            )
+            .await?;
+
+        state_sender.send_modify(|state| {
+            *state.get_mut() = *target;
+        });
+
+        Ok(())
+    }
+}
+""".strip() + "\\n")
+
+
+# 5. Register the module in modules.rs.
+p = ROOT / "modules.rs"
+s = p.read_text()
+if "mod volume_balance;" not in s:
+    s = s.replace(
+        "mod listening_mode;",
+        "mod listening_mode;\\nmod volume_balance;",
+        1,
+    )
+
+if "pub fn d1301_volume_balance" not in s:
+    marker = "\\n}\\n"
+    pos = s.rfind(marker)
+    if pos < 0:
+        raise RuntimeError("Не найден конец impl в modules.rs")
+    method = """
+
+    pub fn d1301_volume_balance(&mut self) {
+        let packet_io = self.packet_io_controller().clone();
+        self.module_collection()
+            .add_d1301_volume_balance(packet_io);
+    }
+"""
+    s = s[:pos] + method + s[pos:]
+
+p.write_text(s)
+
+
+# 6. Enable the module in the D1301 device builder.
+p = Path("lib/src/devices/soundcore/d1301.rs")
+s = p.read_text()
+if "builder.d1301_volume_balance();" not in s:
+    s = s.replace(
+        "        builder.d1301_listening_mode();",
+        "        builder.d1301_listening_mode();\\n"
+        "        builder.d1301_volume_balance();",
+        1,
+    )
+    p.write_text(s)
+
+print("Experimental D1301 volume balance patch applied.")
